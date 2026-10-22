@@ -32,17 +32,18 @@ jobs:
           fi
           bash build.sh
 
+      - name: Report compile errors
+        if: failure()
+        run: |
+          grep -E "error:" build/swiftc.log | head -20 | while IFS= read -r line; do
+            echo "::error title=swiftc::$line"
+          done
+
       - name: Smoke test
         run: |
-          RES="build/Torrent Disk.app/Contents/Resources"
-          DATA="$HOME/Library/Application Support/TorrentDisk"
-          report() {
-            echo "::error title=$1::$(tail -n 20 "$DATA/logs/stdout.log" 2>/dev/null | tr '\n' '|' | cut -c1-3000)"
-            exit 1
-          }
+          BIN="build/Torrent Disk.app/Contents/MacOS/TorrentDisk"
           # Маленький .torrent для проверки: пиров нет, но список файлов берётся из самого файла.
-          mkdir -p "$DATA/torrents"
-          python3 - "$DATA/torrents/test.torrent" <<'PY'
+          python3 - "$RUNNER_TEMP/test.torrent" <<'PY'
           import hashlib, os, sys
           data = os.urandom(300000)
           plen = 262144
@@ -53,19 +54,19 @@ jobs:
               if isinstance(x, bytes): return b"%d:%s" % (len(x), x)
               if isinstance(x, list): return b"l" + b"".join(map(be, x)) + b"e"
               return b"d" + b"".join(be(k) + be(x[k]) for k in sorted(x)) + b"e"
-          info = {"name": "Library", "piece length": plen, "pieces": pieces,
+          info = {"name": "Библиотека", "piece length": plen, "pieces": pieces,
                   "files": [{"length": len(data), "path": ["books", "book.fb2"]}]}
           open(sys.argv[1], "wb").write(be({"info": info}))
           PY
-          "$RES/tdisk.sh" start || report "start failed"
-          PASS=$(cat "$DATA/.password")
-          code=$(curl -s -o /dev/null -w '%{http_code}' -X PROPFIND -H "Depth: 1" -u "admin:$PASS" http://127.0.0.1:36911/)
-          [ "$code" = 207 ] || report "webdav returned $code"
-          curl -s -X PROPFIND -H "Depth: 1" -u "admin:$PASS" http://127.0.0.1:36911/torrents/ | grep -q Library \
-            || report "torrent not listed in webdav"
-          code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:4444/api/status)
-          [ "$code" = 200 ] || report "http api returned $code"
-          "$RES/tdisk.sh" stop
+          if out=$("$BIN" --selftest "$RUNNER_TEMP/test.torrent" 2>&1); then
+            echo "::notice title=selftest::$(echo "$out" | tr '\n' '|')"
+          else
+            echo "::error title=selftest::$(echo "$out" | tr '\n' '|' | cut -c1-3000)"
+            exit 1
+          fi
+          # Подключение диска на CI-машине может быть недоступно — результат только для информации.
+          out=$("$BIN" --selftest "$RUNNER_TEMP/test.torrent" --mount 2>&1) || true
+          echo "::notice title=mount test::$(echo "$out" | tr '\n' '|' | cut -c1-3000)"
 
       - uses: actions/upload-artifact@v4
         with:
