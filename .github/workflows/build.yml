@@ -25,10 +25,17 @@ jobs:
       - name: Smoke test
         run: |
           RES="build/Torrent Disk.app/Contents/Resources"
-          "$RES/tdisk.sh" start
-          PASS=$(cat "$HOME/Library/Application Support/TorrentDisk/.password")
-          curl -fsS -X PROPFIND -H "Depth: 1" -u "admin:$PASS" http://127.0.0.1:36911/
-          curl -fsS http://127.0.0.1:4444/api/status
+          DATA="$HOME/Library/Application Support/TorrentDisk"
+          report() {
+            echo "::error title=$1::$(tail -n 20 "$DATA/logs/stdout.log" 2>/dev/null | tr '\n' '|' | cut -c1-3000)"
+            exit 1
+          }
+          "$RES/tdisk.sh" start || report "start failed"
+          PASS=$(cat "$DATA/.password")
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X PROPFIND -H "Depth: 1" -u "admin:$PASS" http://127.0.0.1:36911/)
+          [ "$code" = 207 ] || report "webdav returned $code"
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:4444/api/status)
+          [ "$code" = 200 ] || report "http api returned $code"
           "$RES/tdisk.sh" stop
 
       - uses: actions/upload-artifact@v4
