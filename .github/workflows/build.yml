@@ -7,6 +7,10 @@ on:
   release:
     types: [published]
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'Версия релиза, например 1.0.0 (пусто — только сборка)'
+        required: false
 
 permissions:
   contents: write
@@ -18,8 +22,12 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Build app and DMG
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+          if [ -n "$INPUT_VERSION" ]; then
+            export VERSION="$INPUT_VERSION"
+          elif [[ "$GITHUB_REF" == refs/tags/v* ]]; then
             export VERSION="${GITHUB_REF_NAME#v}"
           fi
           bash build.sh
@@ -65,8 +73,10 @@ jobs:
           path: build/TorrentDisk.dmg
 
       - name: Release
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.version != ''
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event.release.tag_name || github.ref_name }}
+          tag_name: ${{ inputs.version && format('v{0}', inputs.version) || github.event.release.tag_name || github.ref_name }}
+          name: Torrent Disk ${{ inputs.version || github.ref_name }}
+          target_commitish: ${{ github.sha }}
           files: build/TorrentDisk.dmg
