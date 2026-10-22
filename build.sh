@@ -63,6 +63,7 @@ cat > "$APP/Contents/Info.plist" <<EOF
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>LSApplicationCategoryType</key><string>public.app-category.utilities</string>
   <key>NSHighResolutionCapable</key><true/>
+  <key>NSLocalNetworkUsageDescription</key><string>Torrent Disk ищет участников раздачи в локальной сети и подключает торренты как диски.</string>
   <key>CFBundleDocumentTypes</key>
   <array>
     <dict>
