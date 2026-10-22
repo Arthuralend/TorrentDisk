@@ -24,16 +24,18 @@ type Torrent struct {
 type Registry struct {
 	cl         *torrent.Client
 	extraPeers []torrent.PeerInfo
+	cache      *pieceCache
 
 	mu    sync.RWMutex
 	byDir map[string]*Torrent
 	byIH  map[metainfo.Hash]*Torrent
 }
 
-func NewRegistry(cl *torrent.Client, extraPeers []torrent.PeerInfo) *Registry {
+func NewRegistry(cl *torrent.Client, extraPeers []torrent.PeerInfo, cache *pieceCache) *Registry {
 	return &Registry{
 		cl:         cl,
 		extraPeers: extraPeers,
+		cache:      cache,
 		byDir:      map[string]*Torrent{},
 		byIH:       map[metainfo.Hash]*Torrent{},
 	}
@@ -66,6 +68,7 @@ func (r *Registry) AddFile(file string) (*Torrent, error) {
 		t.AddPeers(r.extraPeers)
 	}
 
+	r.cache.track(t)
 	tor := &Torrent{t: t, root: buildTree(t)}
 	tor.Dir = r.uniqueDir(dirName(t))
 	r.byDir[tor.Dir] = tor
@@ -80,6 +83,7 @@ func (r *Registry) Remove(ih metainfo.Hash) bool {
 	if tor == nil {
 		return false
 	}
+	r.cache.untrack(tor.t)
 	tor.t.Drop()
 	delete(r.byIH, ih)
 	delete(r.byDir, tor.Dir)
@@ -143,6 +147,7 @@ type TorrentStatus struct {
 	Name      string `json:"name"`
 	Dir       string `json:"dir"`
 	Size      int64  `json:"size"`
+	PieceSize int64  `json:"pieceSize"`
 	Completed int64  `json:"completed"`
 	Peers     int    `json:"peers"`
 	Seeders   int    `json:"seeders"`
@@ -155,6 +160,7 @@ func (t *Torrent) Status() TorrentStatus {
 		Name:      toUTF8(t.t.Info().BestName()),
 		Dir:       t.Dir,
 		Size:      t.t.Info().TotalLength(),
+		PieceSize: t.t.Info().PieceLength,
 		Completed: t.t.BytesCompleted(),
 		Peers:     stats.ActivePeers,
 		Seeders:   stats.ConnectedSeeders,

@@ -15,6 +15,12 @@ struct EngineTorrent: Decodable, Equatable {
     let completed: Int64
     let peers: Int
     let seeders: Int
+    let pieceSize: Int64
+}
+
+struct CacheStatus: Decodable, Equatable {
+    let used: Int64
+    let capacity: Int64
 }
 
 /// Управляет встроенным движком (torrentdisk-engine) и подключением его WebDAV-папок как дисков.
@@ -80,6 +86,9 @@ final class Server {
         return process?.isRunning ?? false
     }
 
+    /// Лимит кеша скачанных кусков, передаётся движку при запуске.
+    var cacheLimit: Int64 = 2 << 30
+
     func start() throws {
         if isRunning { return }
         try installBinary()
@@ -95,6 +104,7 @@ final class Server {
             "-data", supportDir.path,
             "-webdav", "127.0.0.1:\(Server.webdavPort)",
             "-api", "127.0.0.1:\(Server.apiPort)",
+            "-cache-mb", String(cacheLimit >> 20),
         ]
         var env = ProcessInfo.processInfo.environment
         env["TD_PASS"] = password
@@ -185,6 +195,23 @@ final class Server {
 
     func remove(hash: String) {
         _ = try? api("DELETE", "/api/torrents/\(hash)")
+    }
+
+    func cacheStatus() throws -> CacheStatus {
+        let (code, data) = try api("GET", "/api/cache")
+        guard code == 200 else { throw ServerError(message: "Движок ответил \(code).") }
+        return try JSONDecoder().decode(CacheStatus.self, from: data)
+    }
+
+    func clearCache() throws -> CacheStatus {
+        let (_, data) = try api("POST", "/api/cache/clear", timeout: 60)
+        return try JSONDecoder().decode(CacheStatus.self, from: data)
+    }
+
+    func setCacheLimit(_ bytes: Int64) throws -> CacheStatus {
+        let body = try JSONSerialization.data(withJSONObject: ["capacity": bytes])
+        let (_, data) = try api("POST", "/api/cache/capacity", body: body, timeout: 60)
+        return try JSONDecoder().decode(CacheStatus.self, from: data)
     }
 
     // MARK: - WebDAV и диски

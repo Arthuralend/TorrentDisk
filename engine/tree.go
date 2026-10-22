@@ -88,7 +88,7 @@ func (a *Archive) load() (*zipDir, error) {
 		r := a.f.NewReader()
 		r.SetResponsive()
 		r.SetReadahead(64 << 10)
-		a.ra = &torrentReaderAt{r: r}
+		a.ra = &torrentReaderAt{r: r, length: a.f.Length()}
 	}
 	zr, err := zip.NewReader(a.ra, a.f.Length())
 	if err != nil {
@@ -130,8 +130,9 @@ func (a *Archive) load() (*zipDir, error) {
 
 // torrentReaderAt даёт произвольный доступ к файлу торрента — нужен для archive/zip.
 type torrentReaderAt struct {
-	mu sync.Mutex
-	r  torrent.Reader
+	mu     sync.Mutex
+	r      torrent.Reader
+	length int64
 }
 
 func (t *torrentReaderAt) ReadAt(p []byte, off int64) (int, error) {
@@ -139,18 +140,44 @@ func (t *torrentReaderAt) ReadAt(p []byte, off int64) (int, error) {
 	defer t.mu.Unlock()
 	ctx, cancel := context.WithTimeout(context.Background(), readTimeout)
 	defer cancel()
-	t.r.SetContext(ctx)
-	if _, err := t.r.Seek(off, io.SeekStart); err != nil {
-		return 0, err
+	n := 0
+	for n < len(p) {
+		m, err := readRetry(ctx, t.r, off+int64(n), p[n:], t.length)
+		n += m
+		if err != nil {
+			return n, err
+		}
 	}
-	n, err := io.ReadFull(t.r, p)
-	if errors.Is(err, io.ErrUnexpectedEOF) {
-		err = io.EOF
+	return n, nil
+}
+
+// readRetry читает с позиции off хотя бы один байт. Ошибки чтения повторяет, пока
+// не истечёт ctx: кусок мог быть вытеснен из кеша в момент чтения и сейчас скачивается заново.
+func readRetry(ctx context.Context, r torrent.Reader, off int64, p []byte, length int64) (int, error) {
+	if off >= length {
+		return 0, io.EOF
 	}
-	if errors.Is(err, context.DeadlineExceeded) {
-		err = errNoPeers
+	for {
+		r.SetContext(ctx)
+		if _, err := r.Seek(off, io.SeekStart); err != nil {
+			return 0, err
+		}
+		n, err := r.Read(p)
+		if n > 0 {
+			return n, nil
+		}
+		if ctx.Err() != nil {
+			return 0, errNoPeers
+		}
+		if err == nil {
+			continue
+		}
+		select {
+		case <-ctx.Done():
+			return 0, errNoPeers
+		case <-time.After(200 * time.Millisecond):
+		}
 	}
-	return n, err
 }
 
 var errNoPeers = errors.New("нужные куски не скачались: нет раздающих или они слишком медленные")

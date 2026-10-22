@@ -290,10 +290,6 @@ func (h *torrentFileHandle) reader() (torrent.Reader, error) {
 		h.r = h.f.NewReader()
 		h.r.SetResponsive()
 		h.r.SetReadahead(4 << 20)
-		h.r.SetContext(h.ctx)
-		if _, err := h.r.Seek(h.pos, io.SeekStart); err != nil {
-			return nil, err
-		}
 	}
 	return h.r, nil
 }
@@ -303,7 +299,9 @@ func (h *torrentFileHandle) Read(p []byte) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	n, err := r.Read(p)
+	ctx, cancel := context.WithTimeout(h.ctx, readTimeout)
+	defer cancel()
+	n, err := readRetry(ctx, r, h.pos, p, h.f.Length())
 	h.pos += int64(n)
 	return n, err
 }

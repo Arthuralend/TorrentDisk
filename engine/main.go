@@ -35,19 +35,27 @@ func (p *peerList) Set(s string) error {
 }
 
 type Engine struct {
-	cl       *torrent.Client
-	reg      *Registry
-	cacheDir string
+	cl    *torrent.Client
+	reg   *Registry
+	cache *pieceCache
+	stop  chan struct{}
 }
 
-func NewEngine(dataDir string, peers []torrent.PeerInfo, disableDHT bool) (*Engine, error) {
-	cacheDir := filepath.Join(dataDir, "cache")
-	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
+// NewEngine запускает торрент-клиент. Скачанные куски хранятся в кеше ограниченного
+// размера: когда он заполнен, давно не читавшиеся куски удаляются (и при необходимости
+// скачиваются снова). cacheBytes < 0 — без ограничения.
+func NewEngine(dataDir string, peers []torrent.PeerInfo, disableDHT bool, cacheBytes int64) (*Engine, error) {
+	// Кеш версии 3.0.0 (файлы целиком, без ограничения размера) больше не нужен.
+	os.RemoveAll(filepath.Join(dataDir, "cache"))
+
+	cache, err := newPieceCache(filepath.Join(dataDir, "pieces"), cacheBytes)
+	if err != nil {
 		return nil, err
 	}
+
 	cfg := torrent.NewDefaultClientConfig()
-	cfg.DataDir = cacheDir
-	cfg.DefaultStorage = storage.NewFileByInfoHash(cacheDir)
+	cfg.DataDir = filepath.Join(dataDir, "pieces")
+	cfg.DefaultStorage = storage.NewResourcePieces(cache.fc.AsResourceProvider())
 	cfg.ListenPort = 0
 	cfg.Seed = true
 	cfg.NoDHT = disableDHT
@@ -60,18 +68,32 @@ func NewEngine(dataDir string, peers []torrent.PeerInfo, disableDHT bool) (*Engi
 	if err != nil {
 		return nil, err
 	}
-	return &Engine{cl: cl, reg: NewRegistry(cl, peers), cacheDir: cacheDir}, nil
+	e := &Engine{cl: cl, reg: NewRegistry(cl, peers, cache), cache: cache, stop: make(chan struct{})}
+	go cache.run(e.stop)
+	return e, nil
 }
 
-func (e *Engine) Close() { e.cl.Close() }
-
-func (e *Engine) Remove(ih metainfo.Hash) bool {
-	if !e.reg.Remove(ih) {
-		return false
-	}
-	os.RemoveAll(filepath.Join(e.cacheDir, ih.HexString()))
-	return true
+func (e *Engine) Close() {
+	close(e.stop)
+	e.cl.Close()
 }
+
+// Куски из кеша вытесняются по мере заполнения, поэтому при удалении торрента
+// его данные отдельно не чистим.
+func (e *Engine) Remove(ih metainfo.Hash) bool { return e.reg.Remove(ih) }
+
+type CacheStatus struct {
+	Used     int64 `json:"used"`
+	Capacity int64 `json:"capacity"`
+}
+
+func (e *Engine) CacheStatus() CacheStatus { return e.cache.status() }
+
+// ClearCache удаляет все скачанные куски. Торренты остаются: при следующем чтении
+// нужные куски скачаются заново.
+func (e *Engine) ClearCache() { e.cache.clear() }
+
+func (e *Engine) SetCacheCapacity(bytes int64) { e.cache.setCapacity(bytes) }
 
 func (e *Engine) apiHandler() http.Handler {
 	mux := http.NewServeMux()
@@ -103,6 +125,24 @@ func (e *Engine) apiHandler() http.Handler {
 			return
 		}
 		writeJSON(w, t.Status())
+	})
+	mux.HandleFunc("GET /api/cache", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, e.CacheStatus())
+	})
+	mux.HandleFunc("POST /api/cache/clear", func(w http.ResponseWriter, r *http.Request) {
+		e.ClearCache()
+		writeJSON(w, e.CacheStatus())
+	})
+	mux.HandleFunc("POST /api/cache/capacity", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Capacity int64 `json:"capacity"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Capacity == 0 {
+			http.Error(w, "нужен capacity", http.StatusBadRequest)
+			return
+		}
+		e.SetCacheCapacity(req.Capacity)
+		writeJSON(w, e.CacheStatus())
 	})
 	mux.HandleFunc("DELETE /api/torrents/{hash}", func(w http.ResponseWriter, r *http.Request) {
 		var ih metainfo.Hash
@@ -152,6 +192,7 @@ func main() {
 	apiAddr := flag.String("api", "127.0.0.1:36912", "адрес HTTP API")
 	user := flag.String("user", "admin", "логин WebDAV")
 	noDHT := flag.Bool("no-dht", false, "отключить DHT")
+	cacheMB := flag.Int64("cache-mb", 2048, "размер кеша скачанных кусков, МБ (-1 — без ограничения)")
 	var peers peerList
 	flag.Var(&peers, "peer", "дополнительный пир host:port (для проверки)")
 	flag.Parse()
@@ -161,7 +202,11 @@ func main() {
 		log.Fatal("TD_PASS не задан")
 	}
 
-	e, err := NewEngine(*dataDir, peers, *noDHT)
+	cacheBytes := *cacheMB
+	if cacheBytes > 0 {
+		cacheBytes <<= 20
+	}
+	e, err := NewEngine(*dataDir, peers, *noDHT, cacheBytes)
 	if err != nil {
 		log.Fatal(err)
 	}

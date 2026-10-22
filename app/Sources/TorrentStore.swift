@@ -6,6 +6,7 @@ struct TorrentItem: Codable, Identifiable, Equatable {
     let id: String          // infohash
     var name: String
     var size: Int64
+    var pieceSize: Int64?   // нет у записей из версий до 3.1
     var addedAt: Date
     var lastUsedAt: Date
 }
@@ -22,6 +23,8 @@ final class TorrentStore: ObservableObject {
     @Published private(set) var stats: [String: EngineTorrent] = [:]
     @Published private(set) var busy: Set<String> = []
     @Published private(set) var serverState: ServerState = .stopped
+    @Published private(set) var cache: CacheStatus?
+    @Published private(set) var cacheLimitGB: Int
     @Published var errorMessage: String?
 
     let server = Server()
@@ -30,7 +33,13 @@ final class TorrentStore: ObservableObject {
     private var refreshTimer: Timer?
     private var refreshing = false
 
+    static let cacheLimitChoices = [1, 2, 5, 10, 20, 50]
+    private static let cacheLimitKey = "cacheLimitGB"
+
     init() {
+        let saved = UserDefaults.standard.integer(forKey: Self.cacheLimitKey)
+        cacheLimitGB = saved > 0 ? saved : 2
+        server.cacheLimit = Int64(cacheLimitGB) << 30
         loadHistory()
         refreshTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
             Task { @MainActor in await self?.refresh() }
@@ -96,7 +105,7 @@ final class TorrentStore: ObservableObject {
                 } else {
                     items.append(TorrentItem(
                         id: meta.infoHash, name: meta.name, size: meta.totalSize,
-                        addedAt: Date(), lastUsedAt: Date()))
+                        pieceSize: meta.pieceSize, addedAt: Date(), lastUsedAt: Date()))
                 }
                 lastAdded = meta.infoHash
             } catch {
@@ -184,6 +193,26 @@ final class TorrentStore: ObservableObject {
         stats = [:]
     }
 
+    func clearCache() async {
+        guard serverState == .running else { return }
+        let server = self.server
+        do {
+            cache = try await run { try server.clearCache() }
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func setCacheLimit(gb: Int) async {
+        cacheLimitGB = gb
+        UserDefaults.standard.set(gb, forKey: Self.cacheLimitKey)
+        let bytes = Int64(gb) << 30
+        server.cacheLimit = bytes
+        guard serverState == .running else { return }
+        let server = self.server
+        cache = try? await run { try server.setCacheLimit(bytes) }
+    }
+
     /// Вызывается при выходе из приложения: отключает диски и останавливает движок.
     func shutdown() {
         for mp in mounts.values { server.unmount(mp) }
@@ -226,6 +255,7 @@ final class TorrentStore: ObservableObject {
         if let list = try? await run({ try server.torrents() }) {
             stats = Dictionary(list.map { ($0.hash, $0) }, uniquingKeysWith: { a, _ in a })
         }
+        cache = try? await run { try server.cacheStatus() }
     }
 
     private func run<T>(_ body: @escaping () throws -> T) async throws -> T {

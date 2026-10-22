@@ -97,6 +97,7 @@ struct TorrentMeta {
     let name: String
     let infoHash: String
     let totalSize: Int64
+    let pieceSize: Int64
 
     init(data: Data) throws {
         var decoder = BDecoder(data)
@@ -108,6 +109,7 @@ struct TorrentMeta {
         let digest = Insecure.SHA1.hash(data: Data(decoder.bytes[range]))
         self.name = name
         self.infoHash = digest.map { String(format: "%02x", $0) }.joined()
+        self.pieceSize = Int64(info["piece length"]?.int ?? 0)
         if let files = info["files"]?.list {
             totalSize = files.reduce(0) { $0 + Int64($1["length"]?.int ?? 0) }
         } else {

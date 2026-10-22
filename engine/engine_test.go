@@ -133,7 +133,7 @@ func TestEndToEnd(t *testing.T) {
 	defer seeder.Close()
 	peer := torrent.PeerInfo{Addr: &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: seeder.LocalPort()}, Trusted: true}
 
-	e, err := NewEngine(filepath.Join(tmp, "engine"), []torrent.PeerInfo{peer}, true)
+	e, err := NewEngine(filepath.Join(tmp, "engine"), []torrent.PeerInfo{peer}, true, -1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -200,6 +200,16 @@ func TestEndToEnd(t *testing.T) {
 		t.Fatalf("downloaded too much: %d of %d", done, total)
 	}
 
+	// После очистки кеша книга скачивается заново.
+	e.ClearCache()
+	// Недокачанные фрагменты и упреждающее чтение могут оставить кусок-другой.
+	if used := e.CacheStatus().Used; used > 3*pieceLen {
+		t.Fatalf("cache not cleared: %d", used)
+	}
+	if again := getBook(t, dav, "/Библиотека/fb2-000001-100000.zip/12345.fb2"); !bytes.Equal(again, book) {
+		t.Fatalf("book after clear: %d bytes", len(again))
+	}
+
 	// Запись запрещена.
 	req, _ = http.NewRequest("PUT", dav.URL+"/Библиотека/new.txt", strings.NewReader("x"))
 	req.SetBasicAuth("admin", "secret")
@@ -231,7 +241,7 @@ func TestSingleFileTorrentDir(t *testing.T) {
 	torrentFile := filepath.Join(tmp, "one.torrent")
 	makeTorrent(t, filepath.Join(tmp, "books.zip"), torrentFile)
 
-	e, err := NewEngine(filepath.Join(tmp, "engine"), nil, true)
+	e, err := NewEngine(filepath.Join(tmp, "engine"), nil, true, -1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -258,5 +268,67 @@ func TestToUTF8(t *testing.T) {
 	}
 	if got := sanitize("a/b"); got != "a_b" {
 		t.Fatalf("got %q", got)
+	}
+}
+
+func getBook(t *testing.T, dav *httptest.Server, p string) []byte {
+	t.Helper()
+	req, _ := http.NewRequest("GET", dav.URL+p, nil)
+	req.SetBasicAuth("admin", "secret")
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	resp, err := http.DefaultClient.Do(req.WithContext(ctx))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		t.Fatalf("GET %s: %d", p, resp.StatusCode)
+	}
+	return body
+}
+
+// Кеш не растёт больше заданного размера: старые куски вытесняются.
+func TestCacheLimit(t *testing.T) {
+	tmp := t.TempDir()
+	seedDir := filepath.Join(tmp, "seed")
+	makeLibrary(t, seedDir)
+	torrentFile := filepath.Join(tmp, "lib.torrent")
+	mi := makeTorrent(t, filepath.Join(seedDir, "Библиотека"), torrentFile)
+	seeder := startSeeder(t, seedDir, mi)
+	defer seeder.Close()
+	peer := torrent.PeerInfo{Addr: &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: seeder.LocalPort()}, Trusted: true}
+
+	const limit = 256 << 10
+	e, err := NewEngine(filepath.Join(tmp, "engine"), []torrent.PeerInfo{peer}, true, limit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	if _, err := e.reg.AddFile(torrentFile); err != nil {
+		t.Fatal(err)
+	}
+	dav := httptest.NewServer(e.webdavHandler("admin", "secret"))
+	defer dav.Close()
+
+	other, _ := os.ReadFile(filepath.Join(seedDir, "Библиотека", "other.bin"))
+	if got := getBook(t, dav, "/Библиотека/other.bin"); !bytes.Equal(got, other) {
+		t.Fatalf("other.bin: %d bytes", len(got))
+	}
+	// Лишнее удаляется в фоне раз в секунду.
+	deadline := time.Now().Add(10 * time.Second)
+	for e.CacheStatus().Used > limit && time.Now().Before(deadline) {
+		time.Sleep(200 * time.Millisecond)
+	}
+	st := e.CacheStatus()
+	t.Logf("cache after reading 1 MiB with %d KiB limit: %d bytes", limit>>10, st.Used)
+	if st.Used > limit {
+		t.Fatalf("cache %d exceeds limit %d", st.Used, limit)
+	}
+
+	// Вытесненные куски скачиваются заново.
+	if got := getBook(t, dav, "/Библиотека/other.bin"); !bytes.Equal(got, other) {
+		t.Fatalf("other.bin after eviction: %d bytes", len(got))
 	}
 }

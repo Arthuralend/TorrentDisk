@@ -15,6 +15,8 @@ struct ContentView: View {
             if let message = store.errorMessage {
                 errorBanner(message)
             }
+            Divider()
+            cacheBar
         }
         .frame(minWidth: 480, minHeight: 520)
     }
@@ -119,6 +121,54 @@ struct ContentView: View {
         }
     }
 
+    // MARK: - Кеш
+
+    private var cacheBar: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "internaldrive")
+                .foregroundStyle(.secondary)
+            Text(cacheText)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .help("Скачанные куски хранятся здесь, чтобы не качать их повторно. "
+                      + "Когда кеш заполнен, давно не открывавшиеся куски удаляются.")
+            if let cache = store.cache, cache.capacity > 0 {
+                ProgressView(value: min(Double(cache.used) / Double(cache.capacity), 1))
+                    .frame(width: 80)
+            }
+            Spacer()
+            Menu {
+                ForEach(TorrentStore.cacheLimitChoices, id: \.self) { gb in
+                    Button {
+                        Task { await store.setCacheLimit(gb: gb) }
+                    } label: {
+                        if gb == store.cacheLimitGB {
+                            Label("\(gb) ГБ", systemImage: "checkmark")
+                        } else {
+                            Text("\(gb) ГБ")
+                        }
+                    }
+                }
+            } label: {
+                Text("Лимит: \(store.cacheLimitGB) ГБ")
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+            Button("Очистить кеш") { Task { await store.clearCache() } }
+                .disabled(store.serverState != .running || (store.cache?.used ?? 0) == 0)
+        }
+        .controlSize(.small)
+        .padding(.horizontal, 20)
+        .padding(.vertical, 10)
+    }
+
+    private var cacheText: String {
+        let limit = "\(store.cacheLimitGB) ГБ"
+        guard let cache = store.cache else { return "Кеш: лимит \(limit)" }
+        let used = ByteCountFormatter.string(fromByteCount: cache.used, countStyle: .file)
+        return "Кеш: \(used) из \(limit)"
+    }
+
     private func errorBanner(_ message: String) -> some View {
         HStack(alignment: .top, spacing: 10) {
             Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
@@ -159,6 +209,8 @@ struct TorrentRow: View {
                 Text(details)
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                    .help("Торрент передаётся кусками: даже ради одной маленькой книги "
+                          + "скачивается как минимум один кусок целиком.")
             }
 
             Spacer(minLength: 8)
@@ -187,12 +239,17 @@ struct TorrentRow: View {
     }
 
     private var details: String {
-        let size = ByteCountFormatter.string(fromByteCount: item.size, countStyle: .file)
-        guard isMounted || isBusy, let stat = store.stats[item.id] else {
-            return "\(size) · \(item.lastUsedAt.formatted(.relative(presentation: .named)))"
+        var parts = [ByteCountFormatter.string(fromByteCount: item.size, countStyle: .file)]
+        let stat = store.stats[item.id]
+        if let piece = item.pieceSize ?? stat?.pieceSize, piece > 0 {
+            parts.append("кусок \(ByteCountFormatter.string(fromByteCount: piece, countStyle: .memory))")
         }
-        let peers = stat.peers == 0 ? "ищу пиров…" : "пиров: \(stat.peers)"
-        let done = ByteCountFormatter.string(fromByteCount: stat.completed, countStyle: .file)
-        return "\(size) · \(peers) · скачано \(done)"
+        if (isMounted || isBusy), let stat {
+            parts.append(stat.peers == 0 ? "ищу пиров…" : "пиров: \(stat.peers)")
+            parts.append("скачано \(ByteCountFormatter.string(fromByteCount: stat.completed, countStyle: .file))")
+        } else {
+            parts.append(item.lastUsedAt.formatted(.relative(presentation: .named)))
+        }
+        return parts.joined(separator: " · ")
     }
 }
