@@ -6,15 +6,26 @@ struct ServerError: LocalizedError {
     var errorDescription: String? { message }
 }
 
-/// Управляет встроенным distribyted и подключением его WebDAV-папок как дисков.
+/// Торрент, как его видит движок.
+struct EngineTorrent: Decodable, Equatable {
+    let hash: String
+    let name: String
+    let dir: String
+    let size: Int64
+    let completed: Int64
+    let peers: Int
+    let seeders: Int
+}
+
+/// Управляет встроенным движком (torrentdisk-engine) и подключением его WebDAV-папок как дисков.
 /// Все методы блокирующие — из интерфейса их вызывают в фоне.
 final class Server {
-    static let port = 36911
-    static let route = "torrents"
+    static let webdavPort = 36911
+    static let apiPort = 36912
+    static let engineName = "torrentdisk-engine"
 
     let supportDir: URL
     let libraryDir: URL
-    private let configURL: URL
     private let logsDir: URL
     private let binaryURL: URL
     private var process: Process?
@@ -24,17 +35,18 @@ final class Server {
         supportDir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("TorrentDisk", isDirectory: true)
         libraryDir = supportDir.appendingPathComponent("library", isDirectory: true)
-        configURL = supportDir.appendingPathComponent("config.yaml")
         logsDir = supportDir.appendingPathComponent("logs", isDirectory: true)
-        binaryURL = supportDir.appendingPathComponent("distribyted")
-        for dir in [libraryDir, logsDir, supportDir.appendingPathComponent("metadata")] {
+        binaryURL = supportDir.appendingPathComponent(Server.engineName)
+        for dir in [libraryDir, logsDir] {
             try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        }
+        // Остатки версии 2.0, работавшей через distribyted.
+        for old in ["distribyted", "config.yaml", "metadata"] {
+            try? FileManager.default.removeItem(at: supportDir.appendingPathComponent(old))
         }
     }
 
-    // MARK: - Пароль и конфигурация
-
-    /// WebDAV в distribyted слушает все сетевые интерфейсы, поэтому пароль случайный.
+    /// Пароль WebDAV: случайный, хранится в папке приложения.
     lazy var password: String = {
         let url = supportDir.appendingPathComponent(".password")
         if let saved = try? String(contentsOf: url, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
@@ -47,44 +59,11 @@ final class Server {
         return pass
     }()
 
-    private func writeConfig() throws {
-        let dir = supportDir.path
-        let config = """
-        http:
-          port: 4444
-          ip: "127.0.0.1"
-          httpfs: true
-
-        webdav:
-          port: \(Server.port)
-          user: admin
-          pass: "\(password)"
-
-        torrent:
-          global_cache_size: 2048
-          metadata_folder: "\(dir)/metadata"
-          continue_when_add_timeout: true
-          add_timeout: 60
-          read_timeout: 120
-
-        log:
-          path: "\(dir)/logs"
-          max_backups: 2
-          max_size: 50
-
-        routes:
-          - name: \(Server.route)
-            torrent_folder: "\(libraryDir.path)"
-
-        """
-        try config.write(to: configURL, atomically: true, encoding: .utf8)
-    }
-
-    /// Копирует distribyted из приложения: так он не зависит от того, где лежит приложение,
+    /// Копирует движок из приложения: так он не зависит от того, где лежит приложение,
     /// и не попадает под карантин Gatekeeper.
     private func installBinary() throws {
-        guard let bundled = Bundle.main.url(forResource: "distribyted", withExtension: nil) else {
-            throw ServerError(message: "В приложении не найден distribyted.")
+        guard let bundled = Bundle.main.url(forResource: Server.engineName, withExtension: nil) else {
+            throw ServerError(message: "В приложении не найден \(Server.engineName).")
         }
         let fm = FileManager.default
         if fm.contentsEqual(atPath: bundled.path, andPath: binaryURL.path) { return }
@@ -104,16 +83,22 @@ final class Server {
     func start() throws {
         if isRunning { return }
         try installBinary()
-        try writeConfig()
         killStray()
 
-        let logURL = logsDir.appendingPathComponent("stdout.log")
+        let logURL = logsDir.appendingPathComponent("engine.log")
         FileManager.default.createFile(atPath: logURL.path, contents: nil)
         let log = try FileHandle(forWritingTo: logURL)
 
         let p = Process()
         p.executableURL = binaryURL
-        p.arguments = ["--config", configURL.path]
+        p.arguments = [
+            "-data", supportDir.path,
+            "-webdav", "127.0.0.1:\(Server.webdavPort)",
+            "-api", "127.0.0.1:\(Server.apiPort)",
+        ]
+        var env = ProcessInfo.processInfo.environment
+        env["TD_PASS"] = password
+        p.environment = env
         p.currentDirectoryURL = supportDir
         p.standardOutput = log
         p.standardError = log
@@ -121,16 +106,15 @@ final class Server {
         try p.run()
         lock.lock(); process = p; lock.unlock()
 
-        // Ждём, пока поднимется WebDAV (торренты загружаются до его старта).
-        let deadline = Date().addingTimeInterval(180)
+        let deadline = Date().addingTimeInterval(30)
         while Date() < deadline {
-            if webdavStatus(path: "/") != nil { return }
+            if (try? api("GET", "/api/health").0) == 200 { return }
             if !p.isRunning {
-                throw ServerError(message: "distribyted завершился с ошибкой:\n" + tailLog())
+                throw ServerError(message: "Движок завершился с ошибкой:\n" + tailLog())
             }
-            Thread.sleep(forTimeInterval: 0.5)
+            Thread.sleep(forTimeInterval: 0.3)
         }
-        throw ServerError(message: "distribyted не запустился за 3 минуты.\n" + tailLog())
+        throw ServerError(message: "Движок не запустился.\n" + tailLog())
     }
 
     func stop() {
@@ -142,26 +126,65 @@ final class Server {
         if p.isRunning { kill(p.processIdentifier, SIGKILL) }
     }
 
-    func restart() throws {
-        stop()
-        try start()
-    }
-
-    /// Останавливает distribyted, оставшийся от прошлого запуска.
+    /// Останавливает движок, оставшийся от прошлого запуска.
     private func killStray() {
         let pkill = Process()
         pkill.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
-        pkill.arguments = ["-f", "distribyted --config \(configURL.path)"]
+        pkill.arguments = ["-f", "\(Server.engineName) -data \(supportDir.path)"]
         try? pkill.run()
         pkill.waitUntilExit()
     }
 
     func tailLog() -> String {
-        let url = logsDir.appendingPathComponent("stdout.log")
+        let url = logsDir.appendingPathComponent("engine.log")
         guard let text = try? String(contentsOf: url, encoding: .utf8) else { return "" }
-        // Убираем цветовые escape-последовательности zerolog.
-        let plain = text.replacingOccurrences(of: "\u{1B}\\[[0-9;]*m", with: "", options: .regularExpression)
-        return plain.split(separator: "\n").suffix(8).joined(separator: "\n")
+        return text.split(separator: "\n").suffix(8).joined(separator: "\n")
+    }
+
+    // MARK: - API движка
+
+    private func api(_ method: String, _ path: String, body: Data? = nil, timeout: TimeInterval = 5) throws -> (Int, Data) {
+        var request = URLRequest(url: URL(string: "http://127.0.0.1:\(Server.apiPort)\(path)")!, timeoutInterval: timeout)
+        request.httpMethod = method
+        if let body {
+            request.httpBody = body
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        }
+        return try send(request)
+    }
+
+    private func send(_ request: URLRequest) throws -> (Int, Data) {
+        var result: Result<(Int, Data), Error> = .failure(ServerError(message: "Нет ответа от движка."))
+        let done = DispatchSemaphore(value: 0)
+        URLSession.shared.dataTask(with: request) { data, response, error in
+            if let error {
+                result = .failure(error)
+            } else {
+                result = .success(((response as? HTTPURLResponse)?.statusCode ?? 0, data ?? Data()))
+            }
+            done.signal()
+        }.resume()
+        done.wait()
+        return try result.get()
+    }
+
+    func torrents() throws -> [EngineTorrent] {
+        let (code, data) = try api("GET", "/api/torrents")
+        guard code == 200 else { throw ServerError(message: "Движок ответил \(code).") }
+        return try JSONDecoder().decode([EngineTorrent].self, from: data)
+    }
+
+    func add(torrentFile: URL) throws -> EngineTorrent {
+        let body = try JSONSerialization.data(withJSONObject: ["path": torrentFile.path])
+        let (code, data) = try api("POST", "/api/torrents", body: body, timeout: 30)
+        guard code == 200 else {
+            throw ServerError(message: String(data: data, encoding: .utf8) ?? "Не удалось добавить торрент.")
+        }
+        return try JSONDecoder().decode(EngineTorrent.self, from: data)
+    }
+
+    func remove(hash: String) {
+        _ = try? api("DELETE", "/api/torrents/\(hash)")
     }
 
     // MARK: - WebDAV и диски
@@ -170,39 +193,28 @@ final class Server {
         var c = URLComponents()
         c.scheme = "http"
         c.host = "127.0.0.1"
-        c.port = Server.port
+        c.port = Server.webdavPort
         c.path = path
         return c.url!
     }
 
-    /// Путь торрента внутри WebDAV. Если торрент — одиночный файл (не архив),
-    /// подключается общая папка, а файл показывается в ней.
-    static func webdavPath(name: String, isFolder: Bool) -> String {
-        isFolder ? "/\(route)/\(name)/" : "/\(route)/"
-    }
+    static func webdavPath(dir: String) -> String { "/\(dir)/" }
 
     /// HTTP-код ответа на PROPFIND или nil, если сервер недоступен.
     func webdavStatus(path: String) -> Int? {
-        var request = URLRequest(url: webdavURL(path: path), timeoutInterval: 5)
+        var request = URLRequest(url: webdavURL(path: path), timeoutInterval: 10)
         request.httpMethod = "PROPFIND"
         request.setValue("0", forHTTPHeaderField: "Depth")
         let auth = Data("admin:\(password)".utf8).base64EncodedString()
         request.setValue("Basic \(auth)", forHTTPHeaderField: "Authorization")
-
-        var status: Int?
-        let done = DispatchSemaphore(value: 0)
-        URLSession.shared.dataTask(with: request) { _, response, _ in
-            status = (response as? HTTPURLResponse)?.statusCode
-            done.signal()
-        }.resume()
-        done.wait()
-        return status
+        return try? send(request).0
     }
 
-    /// Подключает папку WebDAV как диск и возвращает путь точки монтирования.
-    func mount(path: String) throws -> URL {
+    /// Подключает папку торрента как диск и возвращает путь точки монтирования.
+    func mount(dir: String) throws -> URL {
+        let path = Server.webdavPath(dir: dir)
         guard webdavStatus(path: path) == 207 else {
-            throw ServerError(message: "Торрент ещё не загрузился в distribyted. Попробуйте через минуту.")
+            throw ServerError(message: "Движок не видит папку «\(dir)». Подробности в журнале:\n" + tailLog())
         }
         // kNAUIOptionKey = kNAUIOptionNoUI: не показывать системных окон входа.
         let openOptions = NSMutableDictionary()

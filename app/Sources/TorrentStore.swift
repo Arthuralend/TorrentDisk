@@ -6,22 +6,20 @@ struct TorrentItem: Codable, Identifiable, Equatable {
     let id: String          // infohash
     var name: String
     var size: Int64
-    var isFolder: Bool
     var addedAt: Date
     var lastUsedAt: Date
-
-    var webdavPath: String { Server.webdavPath(name: name, isFolder: isFolder) }
 }
 
 enum ServerState {
     case stopped, starting, running
 }
 
-/// Состояние приложения: история торрентов, подключённые диски, статус сервера.
+/// Состояние приложения: история торрентов, подключённые диски, статус движка.
 @MainActor
 final class TorrentStore: ObservableObject {
     @Published private(set) var items: [TorrentItem] = []
     @Published private(set) var mounts: [String: URL] = [:]
+    @Published private(set) var stats: [String: EngineTorrent] = [:]
     @Published private(set) var busy: Set<String> = []
     @Published private(set) var serverState: ServerState = .stopped
     @Published var errorMessage: String?
@@ -30,11 +28,12 @@ final class TorrentStore: ObservableObject {
     private let queue = DispatchQueue(label: "torrentdisk.server")
     private var historyURL: URL { server.supportDir.appendingPathComponent("history.json") }
     private var refreshTimer: Timer?
+    private var refreshing = false
 
     init() {
         loadHistory()
         refreshTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.dropEjectedMounts() }
+            Task { @MainActor in await self?.refresh() }
         }
         if !items.isEmpty {
             Task { await ensureServer() }
@@ -80,7 +79,6 @@ final class TorrentStore: ObservableObject {
     /// Добавляет .torrent-файлы в историю и сразу подключает последний из них.
     func add(_ urls: [URL]) async {
         var lastAdded: String?
-        var hasNew = false
         for url in urls {
             guard url.pathExtension.lowercased() == "torrent" else {
                 errorMessage = "«\(url.lastPathComponent)» — не .torrent-файл."
@@ -89,14 +87,16 @@ final class TorrentStore: ObservableObject {
             do {
                 let data = try Data(contentsOf: url)
                 let meta = try TorrentMeta(data: data)
+                let file = torrentFile(meta.infoHash)
+                if !FileManager.default.fileExists(atPath: file.path) {
+                    try data.write(to: file, options: .atomic)
+                }
                 if let i = items.firstIndex(where: { $0.id == meta.infoHash }) {
                     items[i].lastUsedAt = Date()
                 } else {
-                    try data.write(to: torrentFile(meta.infoHash), options: .atomic)
                     items.append(TorrentItem(
                         id: meta.infoHash, name: meta.name, size: meta.totalSize,
-                        isFolder: meta.isFolder, addedAt: Date(), lastUsedAt: Date()))
-                    hasNew = true
+                        addedAt: Date(), lastUsedAt: Date()))
                 }
                 lastAdded = meta.infoHash
             } catch {
@@ -107,10 +107,6 @@ final class TorrentStore: ObservableObject {
         saveHistory()
 
         guard let id = lastAdded else { return }
-        // distribyted читает папку с торрентами только при старте.
-        if hasNew {
-            await restartServer()
-        }
         if mounts[id] == nil {
             await mount(id)
         } else {
@@ -130,25 +126,22 @@ final class TorrentStore: ObservableObject {
     }
 
     func mount(_ id: String, open: Bool = true) async {
-        guard let item = items.first(where: { $0.id == id }) else { return }
+        guard items.contains(where: { $0.id == id }) else { return }
         busy.insert(id)
         defer { busy.remove(id) }
 
         guard await ensureServer() else { return }
-
-        // Одиночные файлы (не архивы) лежат в общей папке — её можно подключить только один раз.
-        let shared = items.first { $0.id != id && $0.webdavPath == item.webdavPath && mounts[$0.id] != nil }
-        if let shared, let mp = mounts[shared.id] {
-            mounts[id] = mp
-        } else {
-            do {
-                let path = item.webdavPath
-                let server = self.server
-                mounts[id] = try await run { try server.mount(path: path) }
-            } catch {
-                errorMessage = error.localizedDescription
-                return
-            }
+        do {
+            let server = self.server
+            let file = torrentFile(id)
+            // Движок сам загружает библиотеку при старте; add для уже добавленного торрента
+            // просто вернёт его — так заодно получаем имя папки.
+            let torrent = try await run { try server.add(torrentFile: file) }
+            stats[id] = torrent
+            mounts[id] = try await run { try server.mount(dir: torrent.dir) }
+        } catch {
+            errorMessage = error.localizedDescription
+            return
         }
         touch(id)
         if open { reveal(id) }
@@ -160,27 +153,26 @@ final class TorrentStore: ObservableObject {
         defer { busy.remove(id) }
         let server = self.server
         await perform { server.unmount(mp) }
-        mounts = mounts.filter { $0.value != mp }
+        mounts[id] = nil
     }
 
     func reveal(_ id: String) {
-        guard let item = items.first(where: { $0.id == id }), let mp = mounts[id] else { return }
-        if item.isFolder {
-            NSWorkspace.shared.open(mp)
-        } else {
-            NSWorkspace.shared.activateFileViewerSelecting([mp.appendingPathComponent(item.name)])
-        }
+        guard let mp = mounts[id] else { return }
+        NSWorkspace.shared.open(mp)
     }
 
     func remove(_ id: String) async {
         if mounts[id] != nil { await unmount(id) }
+        if server.isRunning {
+            let server = self.server
+            await perform { server.remove(hash: id) }
+        }
         try? FileManager.default.removeItem(at: torrentFile(id))
         items.removeAll { $0.id == id }
+        stats[id] = nil
         saveHistory()
         if items.isEmpty {
             await stopAll()
-        } else if serverState == .running {
-            await restartServer()
         }
     }
 
@@ -189,16 +181,17 @@ final class TorrentStore: ObservableObject {
         let server = self.server
         await perform { server.stop() }
         serverState = .stopped
+        stats = [:]
     }
 
-    /// Вызывается при выходе из приложения: отключает диски и останавливает distribyted.
+    /// Вызывается при выходе из приложения: отключает диски и останавливает движок.
     func shutdown() {
-        for mp in Set(mounts.values) { server.unmount(mp) }
+        for mp in mounts.values { server.unmount(mp) }
         mounts = [:]
         server.stop()
     }
 
-    // MARK: - Сервер
+    // MARK: - Движок
 
     @discardableResult
     private func ensureServer() async -> Bool {
@@ -219,29 +212,20 @@ final class TorrentStore: ObservableObject {
         }
     }
 
-    /// Перезапускает distribyted и заново подключает диски, которые были подключены.
-    private func restartServer() async {
-        let wasMounted = Array(mounts.keys)
-        for mp in Set(mounts.values) {
-            let server = self.server
-            await perform { server.unmount(mp) }
+    /// Обновляет пиры и прогресс; если диск извлекли в Finder, отмечает его как отключённый.
+    private func refresh() async {
+        if !mounts.isEmpty {
+            let mounted = Server.mountedPaths()
+            let alive = mounts.filter { mounted.contains($0.value.path) }
+            if alive.count != mounts.count { mounts = alive }
         }
-        mounts = [:]
+        guard serverState == .running, !refreshing else { return }
+        refreshing = true
+        defer { refreshing = false }
         let server = self.server
-        await perform { server.stop() }
-        serverState = .stopped
-        guard await ensureServer() else { return }
-        for id in wasMounted where items.contains(where: { $0.id == id }) {
-            await mount(id, open: false)
+        if let list = try? await run({ try server.torrents() }) {
+            stats = Dictionary(list.map { ($0.hash, $0) }, uniquingKeysWith: { a, _ in a })
         }
-    }
-
-    /// Если диск извлекли в Finder, отмечаем его как отключённый.
-    private func dropEjectedMounts() {
-        guard !mounts.isEmpty else { return }
-        let mounted = Server.mountedPaths()
-        let alive = mounts.filter { mounted.contains($0.value.path) }
-        if alive.count != mounts.count { mounts = alive }
     }
 
     private func run<T>(_ body: @escaping () throws -> T) async throws -> T {

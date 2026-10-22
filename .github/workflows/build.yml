@@ -21,6 +21,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: engine/go.mod
+          cache-dependency-path: engine/go.sum
+
+      - name: Engine tests
+        working-directory: engine
+        run: |
+          if ! out=$(CGO_ENABLED=0 go test -count=1 -v ./... 2>&1); then
+            echo "$out" | grep -E "FAIL|_test.go" | head -20 | while IFS= read -r line; do echo "::error title=go test::$line"; done
+            exit 1
+          fi
+          echo "::notice title=go test::$(echo "$out" | grep -E "after reading|^ok" | tr '\n' '|')"
+
       - name: Build app and DMG
         env:
           INPUT_VERSION: ${{ inputs.version }}

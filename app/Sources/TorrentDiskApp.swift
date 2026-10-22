@@ -48,7 +48,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
-/// Проверка без интерфейса для CI: запускает distribyted с одним торрентом
+/// Проверка без интерфейса для CI: запускает движок с одним торрентом
 /// и убеждается, что его папка доступна по WebDAV (и, с --mount, подключается как диск).
 enum SelfTest {
     static func run(torrentPath: String, mount: Bool) -> Int32 {
@@ -57,17 +57,19 @@ enum SelfTest {
         do {
             let data = try Data(contentsOf: URL(fileURLWithPath: torrentPath))
             let meta = try TorrentMeta(data: data)
-            print("torrent: \(meta.name), \(meta.totalSize) bytes, folder=\(meta.isFolder), hash=\(meta.infoHash)")
-            try data.write(to: server.libraryDir.appendingPathComponent("\(meta.infoHash).torrent"))
+            print("torrent: \(meta.name), \(meta.totalSize) bytes, hash=\(meta.infoHash)")
+            let file = server.libraryDir.appendingPathComponent("\(meta.infoHash).torrent")
+            try data.write(to: file)
 
             try server.start()
-            let path = Server.webdavPath(name: meta.name, isFolder: meta.isFolder)
+            let torrent = try server.add(torrentFile: file)
+            let path = Server.webdavPath(dir: torrent.dir)
             let status = server.webdavStatus(path: path)
             print("PROPFIND \(path): \(status.map(String.init) ?? "no response")")
             guard status == 207 else { return 1 }
 
             if mount {
-                let mp = try server.mount(path: path)
+                let mp = try server.mount(dir: torrent.dir)
                 let files = try FileManager.default.contentsOfDirectory(atPath: mp.path)
                 print("mounted at \(mp.path): \(files)")
                 server.unmount(mp)

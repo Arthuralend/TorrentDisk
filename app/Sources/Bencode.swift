@@ -14,7 +14,10 @@ enum BValue {
     }
 
     var string: String? {
-        if case .bytes(let b) = self { return String(data: b, encoding: .utf8) }
+        if case .bytes(let b) = self {
+            // Старые торренты из Windows иногда хранят имена в CP1251.
+            return String(data: b, encoding: .utf8) ?? String(data: b, encoding: .windowsCP1251)
+        }
         return nil
     }
 
@@ -94,8 +97,6 @@ struct TorrentMeta {
     let name: String
     let infoHash: String
     let totalSize: Int64
-    /// true, если в WebDAV торрент будет папкой (несколько файлов или один архив).
-    let isFolder: Bool
 
     init(data: Data) throws {
         var decoder = BDecoder(data)
@@ -109,11 +110,8 @@ struct TorrentMeta {
         self.infoHash = digest.map { String(format: "%02x", $0) }.joined()
         if let files = info["files"]?.list {
             totalSize = files.reduce(0) { $0 + Int64($1["length"]?.int ?? 0) }
-            isFolder = true
         } else {
             totalSize = Int64(info["length"]?.int ?? 0)
-            let ext = (name as NSString).pathExtension.lowercased()
-            isFolder = ["zip", "rar", "7z"].contains(ext)
         }
     }
 }

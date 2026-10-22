@@ -50,7 +50,7 @@ struct ContentView: View {
         .padding(.horizontal, 10)
         .padding(.vertical, 5)
         .background(.quaternary, in: Capsule())
-        .help(store.serverState == .running ? "Встроенный distribyted запущен" : "")
+        .help(store.serverState == .running ? "Торрент-движок запущен" : "")
     }
 
     // MARK: - Зона перетаскивания
@@ -188,7 +188,11 @@ struct TorrentRow: View {
 
     private var details: String {
         let size = ByteCountFormatter.string(fromByteCount: item.size, countStyle: .file)
-        let date = item.lastUsedAt.formatted(.relative(presentation: .named))
-        return isMounted ? "\(size) · подключён" : "\(size) · \(date)"
+        guard isMounted || isBusy, let stat = store.stats[item.id] else {
+            return "\(size) · \(item.lastUsedAt.formatted(.relative(presentation: .named)))"
+        }
+        let peers = stat.peers == 0 ? "ищу пиров…" : "пиров: \(stat.peers)"
+        let done = ByteCountFormatter.string(fromByteCount: stat.completed, countStyle: .file)
+        return "\(size) · \(peers) · скачано \(done)"
     }
 }

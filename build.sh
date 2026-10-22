@@ -2,11 +2,7 @@
 # Собирает build/Torrent Disk.app и build/TorrentDisk.dmg. Запускается на macOS с Xcode.
 set -euo pipefail
 
-VERSION="${VERSION:-2.0.0}"
-DISTRIBYTED_VERSION="v0.15.0"
-DISTRIBYTED_URL="https://github.com/distribyted/distribyted/releases/download/$DISTRIBYTED_VERSION/distribyted-$DISTRIBYTED_VERSION-darwin-arm64"
-DISTRIBYTED_LICENSE_URL="https://raw.githubusercontent.com/distribyted/distribyted/$DISTRIBYTED_VERSION/LICENSE"
-
+VERSION="${VERSION:-3.0.0}"
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 BUILD="$ROOT/build"
 APP="$BUILD/Torrent Disk.app"
@@ -37,13 +33,13 @@ else
   echo "warning: значок не создан"
 fi
 
-# distribyted и его лицензия (GPL-3.0).
-curl -fsSL -o "$RES/distribyted" "$DISTRIBYTED_URL"
-chmod +x "$RES/distribyted"
-curl -fsSL -o "$RES/distribyted-LICENSE.txt" "$DISTRIBYTED_LICENSE_URL"
-cat > "$RES/distribyted-SOURCE.txt" <<EOF
-Torrent Disk включает distribyted $DISTRIBYTED_VERSION (GPL-3.0).
-Исходный код: https://github.com/distribyted/distribyted/tree/$DISTRIBYTED_VERSION
+# Торрент-движок.
+(cd "$ROOT/engine" && CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags "-s -w" \
+  -o "$RES/torrentdisk-engine" .)
+cat > "$RES/Licenses.txt" <<EOF
+Torrent Disk использует библиотеки с открытым исходным кодом:
+- anacrolix/torrent (MPL-2.0): https://github.com/anacrolix/torrent
+- golang.org/x/net, golang.org/x/text (BSD-3-Clause): https://go.googlesource.com/
 EOF
 
 cat > "$APP/Contents/Info.plist" <<EOF
@@ -92,7 +88,7 @@ EOF
 plutil -lint "$APP/Contents/Info.plist"
 
 # Ad-hoc подпись: без Apple Developer ID, но Apple Silicon требует хотя бы её.
-codesign --force --sign - "$RES/distribyted"
+codesign --force --sign - "$RES/torrentdisk-engine"
 codesign --force --sign - "$APP"
 codesign --verify --deep "$APP"
 
