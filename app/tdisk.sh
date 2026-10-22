@@ -101,7 +101,12 @@ stop() {
 
 open_disk() {
   start
-  local mp
+  local code mp
+  code=$(curl -s -o /dev/null -w '%{http_code}' -X PROPFIND -H "Depth: 0" -u "admin:$PASS" "$URL")
+  if [ "$code" != 207 ]; then
+    echo "Пока не добавлено ни одного торрента. Перетащите .torrent-файл на значок Torrent Disk." >&2
+    exit 1
+  fi
   mp=$(mount_point)
   if [ -z "$mp" ]; then
     osascript -e "mount volume \"$URL\" as user name \"admin\" with password \"$PASS\"" >/dev/null

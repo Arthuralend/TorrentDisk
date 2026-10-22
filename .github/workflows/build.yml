@@ -30,10 +30,29 @@ jobs:
             echo "::error title=$1::$(tail -n 20 "$DATA/logs/stdout.log" 2>/dev/null | tr '\n' '|' | cut -c1-3000)"
             exit 1
           }
+          # Маленький .torrent для проверки: пиров нет, но список файлов берётся из самого файла.
+          mkdir -p "$DATA/torrents"
+          python3 - "$DATA/torrents/test.torrent" <<'PY'
+          import hashlib, os, sys
+          data = os.urandom(300000)
+          plen = 262144
+          pieces = b"".join(hashlib.sha1(data[i:i+plen]).digest() for i in range(0, len(data), plen))
+          def be(x):
+              if isinstance(x, int): return b"i%de" % x
+              if isinstance(x, str): x = x.encode()
+              if isinstance(x, bytes): return b"%d:%s" % (len(x), x)
+              if isinstance(x, list): return b"l" + b"".join(map(be, x)) + b"e"
+              return b"d" + b"".join(be(k) + be(x[k]) for k in sorted(x)) + b"e"
+          info = {"name": "Library", "piece length": plen, "pieces": pieces,
+                  "files": [{"length": len(data), "path": ["books", "book.fb2"]}]}
+          open(sys.argv[1], "wb").write(be({"info": info}))
+          PY
           "$RES/tdisk.sh" start || report "start failed"
           PASS=$(cat "$DATA/.password")
           code=$(curl -s -o /dev/null -w '%{http_code}' -X PROPFIND -H "Depth: 1" -u "admin:$PASS" http://127.0.0.1:36911/)
           [ "$code" = 207 ] || report "webdav returned $code"
+          curl -s -X PROPFIND -H "Depth: 1" -u "admin:$PASS" http://127.0.0.1:36911/torrents/ | grep -q Library \
+            || report "torrent not listed in webdav"
           code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:4444/api/status)
           [ "$code" = 200 ] || report "http api returned $code"
           "$RES/tdisk.sh" stop
