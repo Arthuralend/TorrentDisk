@@ -26,7 +26,8 @@ jobs:
         run: |
           RES="build/Torrent Disk.app/Contents/Resources"
           "$RES/tdisk.sh" start
-          curl -fsS -o /dev/null -u "admin:$(cat "$HOME/Library/Application Support/TorrentDisk/.password")" http://127.0.0.1:36911/
+          PASS=$(cat "$HOME/Library/Application Support/TorrentDisk/.password")
+          curl -fsS -X PROPFIND -H "Depth: 1" -u "admin:$PASS" http://127.0.0.1:36911/
           curl -fsS http://127.0.0.1:4444/api/status
           "$RES/tdisk.sh" stop
 
